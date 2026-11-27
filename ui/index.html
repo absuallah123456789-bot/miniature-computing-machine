@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>ChesLan</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="brand">
+      <h1>ChesLan</h1>
+      <p id="subtitle">by MalikHw47</p>
+      <button id="btn-app-settings" class="icon-btn app-settings-btn" type="button" title="Settings" aria-label="Settings">
+        <img src="assets/icons/gear.svg" alt="" aria-hidden="true">
+      </button>
+    </header>
+
+    <!-- Onboarding / lobby -->
+    <section id="screen-lobby" class="screen">
+      <label class="field">
+        <span>Username</span>
+        <input id="in-name" type="text" maxlength="24" autocomplete="off" spellcheck="false" placeholder="Leave empty for a random name">
+      </label>
+
+      <div class="field">
+        <span>Profile picture</span>
+        <div class="avatar-row">
+          <div id="avatar-preview" class="avatar big" aria-label="Profile picture preview"></div>
+          <button id="btn-pick" class="btn">Choose picture…</button>
+          <input id="in-file" type="file" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <div class="field grow">
+        <span>Players on your network</span>
+        <ul id="peer-list" class="peer-list" role="listbox"></ul>
+        <p id="peer-empty" class="muted">Looking for other ChesLan players on this Wi-Fi/LAN…</p>
+      </div>
+
+      <details class="ip-box">
+        <summary>Can't see your friend? Connect by IP</summary>
+        <div class="ip-row">
+          <input id="in-ip" type="text" inputmode="decimal" placeholder="192.168.1.20" autocomplete="off">
+          <button id="btn-ip" class="btn">Connect</button>
+        </div>
+      </details>
+
+      <div class="confirm-row">
+        <details id="settings" class="settings">
+          <summary><span id="settings-summary">Game settings</span></summary>
+          <div class="settings-panel">
+            <label class="field">
+              <span>Type</span>
+              <select id="sel-type">
+                <option value="none">No timer</option>
+                <optgroup label="Bullet">
+                  <option value="1+0">1 min</option>
+                  <option value="1+1">1 + 1</option>
+                  <option value="2+1">2 + 1</option>
+                </optgroup>
+                <optgroup label="Blitz">
+                  <option value="3+0">3 min</option>
+                  <option value="3+2">3 + 2</option>
+                  <option value="5+0">5 min</option>
+                </optgroup>
+                <optgroup label="Rapid">
+                  <option value="10+0">10 min</option>
+                  <option value="10+5">10 + 5</option>
+                  <option value="15+10">15 + 10</option>
+                </optgroup>
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            <div id="custom-box" class="custom-box" hidden>
+              <label class="field"><span>Initial: <b id="lbl-init">10</b> min</span>
+                <input id="rng-init" type="range" min="1" max="120" step="1" value="10"></label>
+              <label class="field"><span>Bonus: <b id="lbl-bonus">0</b> s</span>
+                <input id="rng-bonus" type="range" min="0" max="60" step="1" value="0"></label>
+            </div>
+            <div class="field">
+              <span>Colors</span>
+              <div class="color-pick" role="radiogroup" aria-label="Your colour">
+                <button type="button" class="color-opt" data-color="white" role="radio" aria-label="White"><img src="assets/pieces/whitepawn.png" alt="White pawn" draggable="false"></button>
+                <button type="button" class="color-opt" data-color="black" role="radio" aria-label="Black"><img src="assets/pieces/blackpawn.png" alt="Black pawn" draggable="false"></button>
+                <button type="button" class="color-opt rand" data-color="random" role="radio">Random</button>
+              </div>
+            </div>
+          </div>
+        </details>
+        <button id="btn-confirm" class="btn primary compact">Confirm</button>
+      </div>
+    </section>
+
+    <!-- Game -->
+    <section id="screen-game" class="screen" hidden>
+      <div id="net-banner" class="banner" hidden></div>
+
+      <div class="stage">
+        <div class="player" id="bar-opp">
+          <div class="avatar sm" data-role="avatar"></div>
+          <div class="pname"><strong data-role="name"></strong><small data-role="os"></small></div>
+          <div class="captured" data-role="captured" aria-label="Pieces taken by opponent"></div>
+          <span class="clock" data-role="clock" hidden>0:00</span>
+        </div>
+
+        <div id="board" class="board" role="grid" aria-label="Chess board"></div>
+
+        <div class="player" id="bar-me">
+          <div class="avatar sm" data-role="avatar"></div>
+          <div class="pname"><strong data-role="name"></strong><small data-role="os"></small></div>
+          <div class="captured" data-role="captured" aria-label="Pieces you took"></div>
+          <span class="clock" data-role="clock" hidden>0:00</span>
+        </div>
+
+        <div class="controls">
+          <div class="history-controls">
+            <button id="btn-prev" class="icon-btn history-btn" aria-label="Previous move" title="Previous move"><span aria-hidden="true">‹</span></button>
+            <span id="history-label" class="history-label" aria-live="polite">Start</span>
+            <button id="btn-next" class="icon-btn history-btn" aria-label="Next move" title="Next move"><span aria-hidden="true">›</span></button>
+          </div>
+          <button id="btn-cancel-premoves" class="btn cancel-premoves" hidden>Cancel Premoves</button>
+          <button id="btn-gear" class="icon-btn" aria-label="Game menu"><img src="assets/icons/gear.svg" alt="" aria-hidden="true"></button>
+          <button id="btn-popup" class="btn" hidden>Show popup</button>
+          <button id="btn-chat" class="icon-btn" aria-label="Chat"><img src="assets/icons/chat.svg" alt="" aria-hidden="true"><span id="chat-badge" class="badge" hidden>0</span></button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
