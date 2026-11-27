@@ -21,6 +21,9 @@ const st = {
   drag: null,           // active drag {from, ghost, moved, wasSel, last:{x,y}}
   anim: null,           // animation hint for the next render
   premoveQueue: [],
+  annot: { arrows: [], squares: [] }, // PC-only arrows / square highlights (right mouse button)
+  arrowDraft: null,
+  lowBuzzed: false,
   moveClasses: [],
   classifiedPly: 0,
   classifying: false,
@@ -72,6 +75,92 @@ const MOVE_CLASS_META = {
   forced: { label: 'Forced' },
 };
 
+// ---------------- vibration (Android) ----------------
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+function buzz(pattern) {
+  if (!IS_ANDROID || !navigator.vibrate) return;
+  try { navigator.vibrate(pattern); } catch { /* ignore */ }
+}
+
+// ---------------- arrows & square highlights (PC / mouse only) ----------------
+const ANNOT_COLORS = { green: '#15a02b', red: '#d9382b', blue: '#2f7de1', yellow: '#e0b21a' };
+const SVGNS = 'http://www.w3.org/2000/svg';
+const annotColor = (e) => (e.shiftKey ? 'red' : e.ctrlKey || e.metaKey ? 'blue' : e.altKey ? 'yellow' : 'green');
+const emptyAnnot = () => ({ arrows: [], squares: [] });
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+  return el;
+}
+
+function arrowOverlay(flip, arrows) {
+  const svg = svgEl('svg', { class: 'board-overlay', viewBox: '0 0 8 8', 'aria-hidden': 'true' });
+  for (const a of arrows) {
+    const f = gridPos(a.from, flip), t = gridPos(a.to, flip);
+    const x1 = f.col + 0.5, y1 = f.row + 0.5, x2 = t.col + 0.5, y2 = t.row + 0.5;
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (!len) continue;
+    const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+    const tipX = x2 - ux * 0.1, tipY = y2 - uy * 0.1;
+    const baseX = tipX - ux * 0.4, baseY = tipY - uy * 0.4;
+    const color = ANNOT_COLORS[a.color] || ANNOT_COLORS.green;
+    const g = svgEl('g', { opacity: '0.8', fill: color, stroke: color });
+    g.append(svgEl('line', { x1: x1 + ux * 0.12, y1: y1 + uy * 0.12, x2: baseX + ux * 0.05, y2: baseY + uy * 0.05, 'stroke-width': 0.16, 'stroke-linecap': 'round' }));
+    g.append(svgEl('polygon', { points: `${tipX},${tipY} ${baseX - uy * 0.22},${baseY + ux * 0.22} ${baseX + uy * 0.22},${baseY - ux * 0.22}`, 'stroke-width': 0.02, 'stroke-linejoin': 'round' }));
+    svg.append(g);
+  }
+  return svg;
+}
+
+function overlayArrows() {
+  const list = [...st.annot.arrows];
+  const d = st.arrowDraft;
+  if (d && d.to !== d.from) list.push({ from: d.from, to: d.to, color: d.color });
+  return list;
+}
+
+function refreshOverlay() {
+  const s = st.session;
+  if (!s) return;
+  const el = $('board');
+  const next = arrowOverlay(isFlipped(s), overlayArrows());
+  const old = el.querySelector('.board-overlay');
+  if (old) old.replaceWith(next); else el.append(next);
+}
+
+function redrawBoard() { if (st.session) renderBoard(positionAt(st.session)); }
+
+function startAnnot(e) {
+  const s = st.session;
+  if (!s) return;
+  const sq = squareAtPoint(e.clientX, e.clientY);
+  if (sq == null) return;
+  st.arrowDraft = { from: sq, to: sq, color: annotColor(e), pointerId: e.pointerId };
+  try { $('board').setPointerCapture(e.pointerId); } catch { /* ignore */ }
+}
+
+function finishAnnot(e, cancelled) {
+  const d = st.arrowDraft;
+  st.arrowDraft = null;
+  try { $('board').releasePointerCapture(d.pointerId); } catch { /* ignore */ }
+  if (cancelled) { refreshOverlay(); return; }
+  const to = squareAtPoint(e.clientX, e.clientY) ?? d.to;
+  if (to === d.from) {
+    if (st.premoveQueue.length) { cancelPremoves(); return; } // right-click still cancels queued premoves
+    const i = st.annot.squares.findIndex((x) => x.sq === to);
+    if (i >= 0 && st.annot.squares[i].color === d.color) st.annot.squares.splice(i, 1);
+    else if (i >= 0) st.annot.squares[i].color = d.color;
+    else st.annot.squares.push({ sq: to, color: d.color });
+  } else {
+    const i = st.annot.arrows.findIndex((x) => x.from === d.from && x.to === to);
+    if (i >= 0 && st.annot.arrows[i].color === d.color) st.annot.arrows.splice(i, 1);
+    else if (i >= 0) st.annot.arrows[i].color = d.color;
+    else st.annot.arrows.push({ from: d.from, to, color: d.color });
+  }
+  redrawBoard();
+}
+
 function loadSettings() {
   try {
     Object.assign(st.settings, JSON.parse(localStorage.getItem('cheslan.settings') || '{}'));
@@ -117,7 +206,8 @@ function getSettings() {
   let i = 0, b = 0;
   if (type === 'custom') { i = initial * 60000; b = bonus * 1000; }
   else if (type !== 'none') { const [m, s] = type.split('+').map(Number); i = m * 60000; b = s * 1000; }
-  return { initial_ms: i, bonus_ms: b, color };
+  const pgn = ($('in-pgn') && $('in-pgn').value.trim()) || null;
+  return { initial_ms: i, bonus_ms: b, color, pgn };
 }
 
 function describeTc(initialMs, bonusMs) {
@@ -137,7 +227,8 @@ function renderSettings() {
   if (type === 'none') label = 'No timer';
   else if (type === 'custom') label = `Custom ${describeTc(initial * 60000, bonus * 1000)}`;
   else label = TYPE_LABEL[type] || type;
-  $('settings-summary').textContent = `${label} · ${COLOR_LABEL[color]}`;
+  const hasPgn = $('in-pgn') && $('in-pgn').value.trim();
+  $('settings-summary').textContent = `${label} · ${COLOR_LABEL[color]}${hasPgn ? ' · PGN' : ''}`;
 }
 
 function initSettings() {
@@ -219,7 +310,7 @@ function renderPeers() {
       class: 'peer', role: 'option', tabindex: '0', 'aria-selected': String(p.id === st.selected),
       onclick: () => { st.selected = p.id; renderPeers(); },
       onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); st.selected = p.id; renderPeers(); } },
-    }, av, h('span', { class: 'pn', text: p.name }), h('span', { class: 'os', text: p.os }));
+    }, av, h('span', { class: 'pn', text: p.name }), p.in_game && h('span', { class: 'os ingame', text: 'In game' }), h('span', { class: 'os', text: p.os }));
     list.append(li);
   }
   $('peer-empty').hidden = st.peers.length > 0;
@@ -239,9 +330,25 @@ async function onConfirm() {
     await saveProfile();
     if (!st.selected) { toast('Saved. Pick a player from the list to start a game.'); return; }
     $('settings').open = false;
+    const target = st.peers.find((p) => p.id === st.selected);
+    if (target && target.in_game) { askSpectate(target); return; }
     await ensureLiveClassifier();
     await api.challenge(st.selected, getSettings());
   } catch (e) { toast(e); }
+}
+
+function askSpectate(peer) {
+  showModal('spectate-ask', () => [
+    h('h2', { text: 'In a game' }),
+    playerRow(peer),
+    h('p', { class: 'sub', text: 'This person is in a game. Want to spectate?' }),
+    h('div', { class: 'btn-grid' },
+      btn('No', () => closeModal('spectate-ask')),
+      btn('Yes', async () => {
+        closeModal('spectate-ask');
+        try { await ensureLiveClassifier(); await api.spectate(peer.id); } catch (e) { toast(e); }
+      }, 'btn primary')),
+  ], { backdropClose: true });
 }
 
 async function onPickFile(e) {
@@ -303,6 +410,13 @@ function setSession(next, hint) {
   const prev = st.session;
   st.session = next;
   const newGame = !prev || prev.game_no !== next.game_no;
+  if (!next.spectator) {
+    if (newGame) st.lowBuzzed = false;
+    const inCheckNow = next.check_sq != null && next.turn === next.my_color && !next.end;
+    if (inCheckNow && (newGame || !prev || prev.ply !== next.ply)) buzz([90, 60, 90]);
+    if (next.end && (newGame || !prev || !prev.end)) buzz([250, 80, 250]);
+  }
+  if (newGame || !prev || prev.ply !== next.ply) st.annot = emptyAnnot();
   const rewind = st.premoveQueue.length && prev && !newGame
     && (next.end || !next.connected || next.check_sq != null);
   st.rewindRoutes = rewind ? premoveRoutes(prev) : null;
@@ -356,7 +470,7 @@ async function classifyPendingMoves() {
 
 async function refresh() {
   const ph = await api.getPhase();
-  if (ph.phase === 'playing') {
+  if (ph.phase === 'playing' || ph.phase === 'spectating') {
     const s = await api.getSession();
     showScreen('game');
     if (s) setSession(s);
@@ -395,6 +509,10 @@ function updateClocks() {
     el.textContent = fmtClock(ms);
     el.classList.toggle('active', active);
     el.classList.toggle('low', ms < 10000);
+    if (!s.spectator && !s.end && color === s.my_color) {
+      if (active && ms > 0 && ms < 10000) { if (!st.lowBuzzed) { st.lowBuzzed = true; buzz([150, 80, 150]); } }
+      else if (ms >= 10000) st.lowBuzzed = false;
+    }
   }
 }
 
@@ -554,6 +672,8 @@ function renderBoard(s) {
       if (st.premoveQueue.some((m) => m.from === sq || m.to === sq)) cls.push('premove');
       if (targets.has(sq)) cls.push(pm.has(sq) ? 'cap' : 'dot');
       const d = h('div', { class: cls.join(' '), role: 'gridcell', 'data-sq': sq });
+      const hl = st.annot.squares.find((x) => x.sq === sq);
+      if (hl) d.append(h('div', { class: `hl hl-${hl.color}` }));
       if (c === 0) d.append(h('span', { class: 'coord rank', text: String(rank + 1) }));
       if (r === 7) d.append(h('span', { class: 'coord file', text: 'abcdefgh'[file] }));
       const p = pm.get(sq);
@@ -577,6 +697,7 @@ function renderBoard(s) {
       el.append(d);
     }
   }
+  el.append(arrowOverlay(flip, overlayArrows()));
   if (st.anim) runMoveAnimation(el, st.anim.virtual ? { ...s, pieces: premoveView } : s, flip, st.anim);
   if (st.rewindRoutes) {
     for (const route of st.rewindRoutes) slidePiece(el, flip, route.from, route.to, null, 220);
@@ -664,9 +785,9 @@ function runMoveAnimation(el, s, flip, { prev, hint, move, reverse }) {
 }
 
 // ---------------- input: click-to-move + drag-to-place ----------------
-function canPlay(s) { return s && !s.end && s.connected && st.viewPly === s.ply && s.turn === s.my_color; }
+function canPlay(s) { return s && !s.spectator && !s.end && s.connected && st.viewPly === s.ply && s.turn === s.my_color; }
 function canQueuePremove(s) {
-  return s && !s.end && s.connected && st.viewPly === s.ply && s.turn !== s.my_color && s.check_sq == null;
+  return s && !s.spectator && !s.end && s.connected && st.viewPly === s.ply && s.turn !== s.my_color && s.check_sq == null;
 }
 
 function premovePosition(s) {
@@ -760,8 +881,12 @@ function startBoardDrag(e, s, sq, p) {
 }
 
 function onBoardDown(e) {
-  if (e.pointerType === 'mouse' && e.button === 2) { cancelPremoves(); e.preventDefault(); return; }
+  if (e.pointerType === 'mouse' && e.button === 2) { e.preventDefault(); startAnnot(e); return; }
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  if (st.annot.arrows.length || st.annot.squares.length) { // left click clears arrows / highlights
+    st.annot = emptyAnnot();
+    queueMicrotask(redrawBoard);
+  }
   const s = st.session;
   if ((!canPlay(s) && !canQueuePremove(s)) || st.drag) return;
   const cell = e.target.closest('.sq');
@@ -806,6 +931,11 @@ function onBoardDown(e) {
 }
 
 function onBoardMove(e) {
+  if (st.arrowDraft) {
+    const sq = squareAtPoint(e.clientX, e.clientY);
+    if (sq != null && sq !== st.arrowDraft.to) { st.arrowDraft.to = sq; refreshOverlay(); }
+    return;
+  }
   const d = st.drag;
   if (!d) return;
   d.last = { x: e.clientX, y: e.clientY };
@@ -815,6 +945,7 @@ function onBoardMove(e) {
 }
 
 function onBoardUp(e) {
+  if (st.arrowDraft) { finishAnnot(e, e.type === 'pointercancel'); return; }
   const d = st.drag;
   if (!d) return;
   st.drag = null;
@@ -880,6 +1011,21 @@ function askPromotion(color) {
 function endText(s) {
   const e = s.end;
   if (!e && !s.connected) return ['Connection Lost', 'Connection to the other player was lost.'];
+  if (s.spectator) {
+    const nameOf = (c) => (c === 'white' ? s.me.name : s.opponent.name);
+    const winner = e.winner ? nameOf(e.winner) : '';
+    const loser = e.winner ? nameOf(e.winner === 'white' ? 'black' : 'white') : '';
+    switch (e.kind) {
+      case 'checkmate': return [`${winner} wins`, 'Checkmate.'];
+      case 'resigned': return [`${winner} wins`, `${loser} resigned.`];
+      case 'timeout': return [`${winner} wins`, `${loser} ran out of time.`];
+      case 'stalemate': return ['Draw', 'Stalemate.'];
+      case 'draw_agreed': return ['Draw', 'Draw by agreement.'];
+      case 'fifty_move': return ['Draw', 'Fifty-move rule.'];
+      case 'threefold': return ['Draw', 'Threefold repetition.'];
+      default: return ['Draw', 'Insufficient material.'];
+    }
+  }
   const won = e.winner === s.my_color;
   switch (e.kind) {
     case 'checkmate': return won ? ['GGs checkmate', 'You delivered checkmate.'] : ['GGs you lost', 'Checkmate.'];
@@ -898,7 +1044,7 @@ function showEndModal() {
     const s = st.session;
     if (!s || (!s.end && s.connected)) return [];
     const [title, sub] = endText(s);
-    const rm = s.rematch_out ? btn('Waiting…', null, 'btn', { disabled: true })
+    const rm = s.spectator ? null : s.rematch_out ? btn('Waiting…', null, 'btn', { disabled: true })
       : btn(s.connected ? 'Rematch' : 'Opponent offline', () => api.requestRematch().then(() => toast('Rematch request sent.')).catch(toast), 'btn primary', { disabled: !s.connected });
     return [
       h('h2', { text: title }),
@@ -935,7 +1081,7 @@ async function openReview() {
     const mine = res[s.my_color], theirs = res[s.my_color === 'white' ? 'black' : 'white'];
     // Opponent on the left, local player ALWAYS on the right.
     const table = h('table', { class: 'review-table' },
-      h('thead', {}, h('tr', {}, h('th', { text: '' }), h('th', { text: s.opponent.name }), h('th', { class: 'me', text: `${s.me.name} (you)` }))),
+      h('thead', {}, h('tr', {}, h('th', { text: '' }), h('th', { text: s.opponent.name }), h('th', { class: 'me', text: s.spectator ? s.me.name : `${s.me.name} (you)` }))),
       h('tbody', {},
         h('tr', {}, h('td', { text: 'Accuracy' }), h('td', { class: 'num', text: theirs.accuracy == null ? '–' : `${theirs.accuracy}%` }), h('td', { class: 'num', text: mine.accuracy == null ? '–' : `${mine.accuracy}%` })),
         ROW_ORDER.filter((k) => CLASSES.includes(k)).map((k) =>
@@ -953,6 +1099,16 @@ async function openReview() {
 function openMenu() {
   const s = st.session;
   if (!s) return;
+  if (s.spectator) {
+    showModal('menu', () => [
+      h('h2', { text: 'Spectating' }),
+      h('div', { class: 'btn-col' },
+        btn('Exit to main menu', () => { closeModal('menu'); api.leaveGame().catch(toast); }, 'btn danger'),
+        btn('Copy PGN', async () => { closeModal('menu'); await copyPgn(); }),
+        btn('Close', () => closeModal('menu'))),
+    ], { backdropClose: true });
+    return;
+  }
   const live = !s.end && s.connected && st.viewPly === s.ply;
   const abandon = s.ply <= 1;
   showModal('menu', () => [
@@ -992,9 +1148,12 @@ const EMOJI_UNIT = '(?:\\p{Regional_Indicator}{2}|[#*0-9]\\uFE0F?\\u20E3|\\p{Ext
 const EMOJI_ONLY = new RegExp(`^${EMOJI_UNIT}{1,4}$`, 'u');
 export const isEmojiOnly = (t) => EMOJI_ONLY.test(t.replace(/\s+/gu, ''));
 
-function addBubble(list, text, mine) {
+function addBubble(list, text, mine, from) {
   const cls = 'bubble' + (mine ? ' me' : '') + (isEmojiOnly(text) ? ' emoji' : '');
-  list.append(h('div', { class: cls, text })); // text node only, never HTML
+  const el = h('div', { class: cls }); // text nodes only, never HTML
+  if (from && !mine) el.append(h('span', { class: 'bubble-from', text: from }));
+  el.append(document.createTextNode(text));
+  list.append(el);
   list.scrollTop = list.scrollHeight;
 }
 
@@ -1005,7 +1164,7 @@ function openChat() {
   const input = h('input', { type: 'text', maxlength: MAX_CHAT, placeholder: 'Message…', autocomplete: 'off', 'aria-label': 'Message' });
   const list = h('div', { class: 'chat-list' });
   chatList = list;
-  for (const m of st.chat) addBubble(list, m.text, m.mine);
+  for (const m of st.chat) addBubble(list, m.text, m.mine, m.from);
   const send = async () => {
     const text = input.value.slice(0, MAX_CHAT);
     if (!text.trim()) return;
@@ -1033,6 +1192,7 @@ async function init() {
   $('btn-pick').addEventListener('click', () => $('in-file').click());
   $('in-file').addEventListener('change', onPickFile);
   $('btn-confirm').addEventListener('click', onConfirm);
+  $('in-pgn').addEventListener('input', renderSettings);
   $('btn-ip').addEventListener('click', onConnectIp);
   $('in-name').addEventListener('input', () => {
     if (!st.pending && !st.profile?.avatar) setAvatar($('avatar-preview'), { name: $('in-name').value || '?', avatar: null });
@@ -1050,7 +1210,7 @@ async function init() {
   board.addEventListener('pointermove', onBoardMove);
   board.addEventListener('pointerup', onBoardUp);
   board.addEventListener('pointercancel', onBoardUp);
-  board.addEventListener('contextmenu', (e) => { e.preventDefault(); cancelPremoves(); });
+  board.addEventListener('contextmenu', (e) => e.preventDefault());
 
   setInterval(updateClocks, 100);
 
@@ -1064,9 +1224,13 @@ async function init() {
   await listen('peer-reconnected', () => toast('Reconnected!'));
   await listen('reconnect-failed', () => toast('Could not reconnect.'));
   await listen('net-error', (m) => toast(m));
-  await listen('chat', (text) => {
-    st.chat.push({ text, mine: false });
-    if (chatList) addBubble(chatList, text, false);
+  await listen('spectator-joined', (name) => toast(`Spectator ${name} came in!`));
+  await listen('spectate-ended', () => toast('The game you were watching has ended.'));
+  await listen('chat', (p) => {
+    const text = typeof p === 'string' ? p : p.text;
+    const from = typeof p === 'string' ? null : p.from;
+    st.chat.push({ text, mine: false, from });
+    if (chatList) addBubble(chatList, text, false, from);
     else { st.unread++; updateBadge(); toast('New chat message'); }
   });
 

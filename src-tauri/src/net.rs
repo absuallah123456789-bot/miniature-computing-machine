@@ -5,6 +5,7 @@
 //!   15 s silence = disconnect.
 use crate::protocol::*;
 use crate::state::*;
+use cheslan_core::game::{Game, Outcome};
 use cheslan_core::types::*;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
@@ -45,7 +46,7 @@ async fn read_msg<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Msg> {
 }
 
 fn player_from_wire(w: WireProfile) -> PlayerDto {
-    PlayerDto { id: clean_text(&w.id, 32), name: peer_name(&w.name), os: clean_os(&w.os), avatar: thumb_data_url(w.avatar.as_deref()) }
+    PlayerDto { id: clean_text(&w.id, 32), name: peer_name(&w.name), os: clean_os(&w.os), avatar: thumb_data_url(w.avatar.as_deref()), in_game: false }
 }
 
 // ---------- discovery ----------
@@ -106,6 +107,7 @@ pub async fn run_discovery(sh: Arc<Shared>) {
             loop {
                 let beacon = {
                     let g = sh.inner.lock().unwrap();
+                    let in_game = matches!(g.phase, Phase::Playing) && g.session.is_some();
                     g.profile.as_ref().map(|p| Beacon {
                         app: "cheslan".into(),
                         v: PROTO_VERSION,
@@ -114,6 +116,7 @@ pub async fn run_discovery(sh: Arc<Shared>) {
                         os: my_os(),
                         port: sh.game_port.load(Ordering::SeqCst),
                         avatar_hash: p.avatar_hash.clone(),
+                        in_game,
                     })
                 };
                 if let Some(b) = beacon {
@@ -170,11 +173,12 @@ fn handle_beacon(sh: &Arc<Shared>, data: &[u8], from: IpAddr) {
         let hash = clean_text(&b.avatar_hash, 32);
         match g.peers.get_mut(&b.id) {
             Some(p) => {
-                if p.info.name != name || p.ip != from || p.port != b.port || p.info.os != os {
+                if p.info.name != name || p.ip != from || p.port != b.port || p.info.os != os || p.info.in_game != b.in_game {
                     changed = true;
                 }
                 p.info.name = name;
                 p.info.os = os;
+                p.info.in_game = b.in_game;
                 p.ip = from;
                 p.port = b.port;
                 p.last_seen = Instant::now();
@@ -190,7 +194,7 @@ fn handle_beacon(sh: &Arc<Shared>, data: &[u8], from: IpAddr) {
                 g.peers.insert(
                     b.id.clone(),
                     Peer {
-                        info: PlayerDto { id: b.id.clone(), name, os, avatar: None },
+                        info: PlayerDto { id: b.id.clone(), name, os, avatar: None, in_game: b.in_game },
                         ip: from,
                         port: b.port,
                         avatar_hash: hash,
@@ -268,16 +272,22 @@ async fn handle_incoming(sh: Arc<Shared>, stream: TcpStream) {
             };
             let _ = write_msg(&mut wr, &Msg::Profile { profile: p }).await;
         }
-        Msg::Challenge { profile, v, tc, color } => {
+        Msg::Challenge { profile, v, tc, color, pgn } => {
             let (tx, rx) = mpsc::unbounded_channel();
             let conn_id = sh.conn_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let who = player_from_wire(profile);
+            let pgn = pgn.filter(|t| !t.trim().is_empty());
+            let pgn_ok = match &pgn {
+                Some(t) => Game::from_pgn(t).map(|g| g.outcome() == Outcome::Ongoing).unwrap_or(false),
+                None => true,
+            };
             let accepted = {
                 let mut g = sh.inner.lock().unwrap();
                 let inner = &mut *g;
-                if v == PROTO_VERSION && tc.validate().is_ok() && valid_color_pref(&color) && matches!(inner.phase, Phase::Idle) && inner.profile.is_some() {
+                if v == PROTO_VERSION && pgn_ok && tc.validate().is_ok() && valid_color_pref(&color) && matches!(inner.phase, Phase::Idle) && inner.profile.is_some() {
                     inner.phase = Phase::Incoming(who.clone());
                     inner.pending = Some((tc, color));
+                    inner.pending_pgn = pgn;
                     inner.link = Some(Link { id: conn_id, tx });
                     true
                 } else {
@@ -291,6 +301,39 @@ async fn handle_incoming(sh: Arc<Shared>, stream: TcpStream) {
             sh.emit("challenge-received", who);
             sh.emit_state();
             run_connection(sh, rd, wr, rx, conn_id).await;
+        }
+        Msg::Spectate { profile, v } => {
+            let who = player_from_wire(profile);
+            let (tx, rx) = mpsc::unbounded_channel();
+            let spec_id = sh.conn_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let ok = {
+                let mut g = sh.inner.lock().unwrap();
+                let inner = &mut *g;
+                if v == PROTO_VERSION && matches!(inner.phase, Phase::Playing) && inner.session.is_some() {
+                    let host_wire = sh.wire_profile(inner);
+                    let (welcome, sync) = {
+                        let s = inner.session.as_ref().unwrap();
+                        (
+                            Msg::SpecWelcome { host: host_wire, other: dto_to_wire(&s.opp), tc: s.tc, start_fen: Some(s.game.start.to_fen()) },
+                            Msg::SpecSync { data: s.spec_sync() },
+                        )
+                    };
+                    let _ = tx.send(welcome);
+                    let _ = tx.send(sync);
+                    inner.spectators.push(SpecLink { id: spec_id, name: who.name.clone(), tx });
+                    // let the other player know too
+                    send(inner, Msg::SpecJoined { name: who.name.clone() });
+                    true
+                } else {
+                    false
+                }
+            };
+            if !ok {
+                let _ = write_msg(&mut wr, &Msg::Busy).await;
+                return;
+            }
+            sh.emit("spectator-joined", who.name.clone());
+            run_spec_conn(sh, rd, wr, rx, spec_id).await;
         }
         Msg::Resume { sid, moves, clock_ms } => {
             let (tx, rx) = mpsc::unbounded_channel();
@@ -341,23 +384,23 @@ fn can_challenge(sh: &Arc<Shared>) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn challenge_peer(sh: Arc<Shared>, peer_id: String, tc: TimeControl, color: String) -> Result<(), String> {
+pub async fn challenge_peer(sh: Arc<Shared>, peer_id: String, tc: TimeControl, color: String, pgn: Option<String>) -> Result<(), String> {
     can_challenge(&sh)?;
     let (addr, who) = {
         let g = sh.inner.lock().unwrap();
         let p = g.peers.get(&peer_id).ok_or_else(|| "That player is no longer visible.".to_string())?;
         (SocketAddr::new(p.ip, p.port), p.info.clone())
     };
-    do_challenge(sh, addr, who, tc, color).await
+    do_challenge(sh, addr, who, tc, color, pgn).await
 }
 
-pub async fn challenge_addr(sh: Arc<Shared>, addr: SocketAddr, tc: TimeControl, color: String) -> Result<(), String> {
+pub async fn challenge_addr(sh: Arc<Shared>, addr: SocketAddr, tc: TimeControl, color: String, pgn: Option<String>) -> Result<(), String> {
     can_challenge(&sh)?;
-    let who = PlayerDto { id: String::new(), name: addr.ip().to_string(), os: "Other".into(), avatar: None };
-    do_challenge(sh, addr, who, tc, color).await
+    let who = PlayerDto { id: String::new(), name: addr.ip().to_string(), os: "Other".into(), avatar: None, in_game: false };
+    do_challenge(sh, addr, who, tc, color, pgn).await
 }
 
-async fn do_challenge(sh: Arc<Shared>, addr: SocketAddr, who: PlayerDto, tc: TimeControl, color: String) -> Result<(), String> {
+async fn do_challenge(sh: Arc<Shared>, addr: SocketAddr, who: PlayerDto, tc: TimeControl, color: String, pgn: Option<String>) -> Result<(), String> {
     tc.validate()?;
     if !valid_color_pref(&color) {
         return Err("Bad colour choice.".into());
@@ -376,8 +419,9 @@ async fn do_challenge(sh: Arc<Shared>, addr: SocketAddr, who: PlayerDto, tc: Tim
         if !matches!(inner.phase, Phase::Idle) {
             return Err("You're already in a game or a challenge.".into());
         }
-        let _ = tx.send(Msg::Challenge { profile: sh.wire_profile(inner), v: PROTO_VERSION, tc, color: color.clone() });
+        let _ = tx.send(Msg::Challenge { profile: sh.wire_profile(inner), v: PROTO_VERSION, tc, color: color.clone(), pgn: pgn.clone() });
         inner.pending = Some((tc, color));
+        inner.pending_pgn = pgn;
         inner.peer_addr = Some(addr);
         inner.phase = Phase::Outgoing(who);
         inner.link = Some(Link { id: conn_id, tx });
@@ -385,6 +429,114 @@ async fn do_challenge(sh: Arc<Shared>, addr: SocketAddr, who: PlayerDto, tc: Tim
     sh.emit_state();
     tauri::async_runtime::spawn(run_connection(sh, rd, wr, rx, conn_id));
     Ok(())
+}
+
+// ---------- spectating ----------
+
+/// Watch the game a visible peer is playing.
+pub async fn spectate_peer(sh: Arc<Shared>, peer_id: String) -> Result<(), String> {
+    can_challenge(&sh)?;
+    let addr = {
+        let g = sh.inner.lock().unwrap();
+        let p = g.peers.get(&peer_id).ok_or_else(|| "That player is no longer visible.".to_string())?;
+        SocketAddr::new(p.ip, p.port)
+    };
+    let profile = {
+        let g = sh.inner.lock().unwrap();
+        sh.wire_profile(&g)
+    };
+    let stream = timeout(Duration::from_secs(4), TcpStream::connect(addr))
+        .await
+        .map_err(|_| "Connection timed out.".to_string())?
+        .map_err(|e| format!("Couldn't connect: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    let (mut rd, mut wr) = stream.into_split();
+    write_msg(&mut wr, &Msg::Spectate { profile, v: PROTO_VERSION }).await.map_err(|e| e.to_string())?;
+    let reply = timeout(Duration::from_secs(4), read_msg(&mut rd))
+        .await
+        .map_err(|_| "No answer from that player.".to_string())?
+        .map_err(|e| e.to_string())?;
+    match reply {
+        Msg::SpecWelcome { host, other, tc, start_fen } => {
+            let host = player_from_wire(host);
+            let other = player_from_wire(other);
+            let (tx, rx) = mpsc::unbounded_channel();
+            let conn_id = sh.conn_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            {
+                let mut g = sh.inner.lock().unwrap();
+                let inner = &mut *g;
+                if !matches!(inner.phase, Phase::Idle) {
+                    return Err("You're already in a game or a challenge.".into());
+                }
+                inner.session = Some(Session::new_spectator(host, other, tc, start_fen));
+                inner.phase = Phase::Spectating;
+                inner.link = Some(Link { id: conn_id, tx });
+            }
+            sh.emit_state();
+            tauri::async_runtime::spawn(run_connection(sh, rd, wr, rx, conn_id));
+            Ok(())
+        }
+        _ => Err("That game can't be spectated right now.".into()),
+    }
+}
+
+/// Host side of one spectator connection.
+async fn run_spec_conn(sh: Arc<Shared>, mut rd: OwnedReadHalf, mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Msg>, spec_id: u64) {
+    let mut writer = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                m = rx.recv() => match m {
+                    Some(m) => {
+                        let leave = matches!(m, Msg::Leave | Msg::Busy);
+                        if write_msg(&mut wr, &m).await.is_err() || leave { break; }
+                    }
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    if write_msg(&mut wr, &Msg::Ping).await.is_err() { break; }
+                }
+            }
+        }
+        let _ = wr.shutdown().await;
+    });
+
+    let sh2 = sh.clone();
+    let reader = async move {
+        loop {
+            match timeout(Duration::from_secs(15), read_msg(&mut rd)).await {
+                Ok(Ok(Msg::GroupChat { text, .. })) => handle_spec_chat(&sh2, spec_id, text),
+                Ok(Ok(Msg::Leave)) => break,
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    };
+    tokio::pin!(reader);
+    tokio::select! {
+        _ = &mut writer => {}
+        _ = &mut reader => {}
+    }
+    writer.abort();
+    let mut g = sh.inner.lock().unwrap();
+    g.spectators.retain(|sp| sp.id != spec_id);
+}
+
+/// A spectator said something: show it to us, the other player and the other spectators.
+fn handle_spec_chat(sh: &Arc<Shared>, spec_id: u64, text: String) {
+    let t = clean_text(&text, MAX_CHAT_CHARS);
+    if t.is_empty() {
+        return;
+    }
+    let from = {
+        let g = sh.inner.lock().unwrap();
+        let Some(name) = g.spectators.iter().find(|sp| sp.id == spec_id).map(|sp| sp.name.clone()) else { return };
+        let msg = Msg::GroupChat { from: name.clone(), text: t.clone() };
+        send(&g, msg.clone());
+        fan_out(&g, &msg, Some(spec_id));
+        name
+    };
+    sh.emit("chat", serde_json::json!({ "text": t, "from": from }));
 }
 
 // ---------- connection actor ----------
@@ -449,6 +601,11 @@ fn on_link_closed(sh: &Arc<Shared>, conn_id: u64) {
             "incoming" => {
                 inner.phase = Phase::Idle;
                 Some("challenge-cancelled")
+            }
+            "spectating" => {
+                inner.phase = Phase::Idle;
+                inner.session = None;
+                Some("spectate-ended")
             }
             "playing" => {
                 let addr = inner.peer_addr;
@@ -643,7 +800,13 @@ fn handle_msg(sh: &Arc<Shared>, msg: Msg) -> bool {
             }
             let opp = player_from_wire(profile);
             let me = sh.me_dto(inner);
-            inner.session = Some(Session::new(me, opp, your_color, 1, tc, clean_text(&sid, 32), true));
+            let mut sess = Session::new(me, opp, your_color, 1, tc, clean_text(&sid, 32), true);
+            if let Some(pgn) = inner.pending_pgn.take() {
+                if let Ok(game) = Game::from_pgn(&pgn) {
+                    sess.with_game(game);
+                }
+            }
+            inner.session = Some(sess);
             inner.phase = Phase::Playing;
             drop(g);
             sh.emit_state();
@@ -691,8 +854,10 @@ fn handle_msg(sh: &Arc<Shared>, msg: Msg) -> bool {
         Msg::Chat { text } => {
             let t = clean_text(&text, MAX_CHAT_CHARS);
             if inner.session.is_some() && !t.is_empty() {
+                let from = inner.session.as_ref().map(|s| s.opp.name.clone()).unwrap_or_default();
+                fan_out(inner, &Msg::GroupChat { from, text: t.clone() }, None);
                 drop(g);
-                sh.emit("chat", t);
+                sh.emit("chat", serde_json::json!({ "text": t, "from": serde_json::Value::Null }));
             }
         }
         Msg::DrawOffer => {
@@ -794,7 +959,38 @@ fn handle_msg(sh: &Arc<Shared>, msg: Msg) -> bool {
             }
             return false;
         }
-        Msg::Resume { .. } | Msg::Ping | Msg::Profile { .. } | Msg::ProfileReq | Msg::Challenge { .. } => {}
+        Msg::GroupChat { from, text } => {
+            let t = clean_text(&text, MAX_CHAT_CHARS);
+            let f = peer_name(&from);
+            if inner.session.is_some() && !t.is_empty() {
+                if !matches!(inner.phase, Phase::Spectating) {
+                    // relay to our own spectators (never back over the player link)
+                    fan_out(inner, &Msg::GroupChat { from: f.clone(), text: t.clone() }, None);
+                }
+                drop(g);
+                sh.emit("chat", serde_json::json!({ "text": t, "from": f }));
+            }
+        }
+        Msg::SpecSync { data } => {
+            let mut ok = false;
+            if matches!(inner.phase, Phase::Spectating) {
+                if let Some(s) = inner.session.as_mut() {
+                    ok = s.apply_spec_sync(&data).is_ok();
+                }
+            }
+            drop(g);
+            if ok {
+                sh.emit_state();
+            }
+        }
+        Msg::SpecJoined { name } => {
+            let n = peer_name(&name);
+            if inner.session.is_some() {
+                drop(g);
+                sh.emit("spectator-joined", n);
+            }
+        }
+        Msg::Resume { .. } | Msg::Ping | Msg::Profile { .. } | Msg::ProfileReq | Msg::Challenge { .. } | Msg::Spectate { .. } | Msg::SpecWelcome { .. } => {}
     }
     true
 }

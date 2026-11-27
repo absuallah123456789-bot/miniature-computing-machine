@@ -124,6 +124,75 @@ impl Game {
     }
 }
 
+/// Maximum PGN size accepted from the UI / network.
+pub const MAX_PGN_CHARS: usize = 100_000;
+
+impl Game {
+    /// Build a game by replaying a PGN's main line. Handles tag pairs (a `[FEN "..."]` tag sets the start
+    /// position), `{}` / `;` comments, `()` variations, `$n` NAGs, move numbers and result tokens.
+    pub fn from_pgn(text: &str) -> Result<Game, String> {
+        if text.chars().count() > MAX_PGN_CHARS {
+            return Err("That PGN is too long.".into());
+        }
+        let mut fen: Option<String> = None;
+        let mut body = String::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                let inner = &t[1..t.len() - 1];
+                if let Some(rest) = inner.strip_prefix("FEN") {
+                    let v = rest.trim().trim_matches('"').trim();
+                    if !v.is_empty() {
+                        fen = Some(v.to_string());
+                    }
+                }
+                continue;
+            }
+            if t.starts_with('%') {
+                continue;
+            }
+            // `;` comments run to the end of the line
+            let line = match line.find(';') {
+                Some(i) => &line[..i],
+                None => line,
+            };
+            body.push_str(line);
+            body.push(' ');
+        }
+        // strip {comments} and (variations, possibly nested)
+        let mut clean = String::with_capacity(body.len());
+        let (mut brace, mut paren) = (0u32, 0u32);
+        for c in body.chars() {
+            match c {
+                '{' => brace += 1,
+                '}' => brace = brace.saturating_sub(1),
+                '(' if brace == 0 => paren += 1,
+                ')' if brace == 0 => paren = paren.saturating_sub(1),
+                _ if brace == 0 && paren == 0 => clean.push(c),
+                _ => {}
+            }
+        }
+        let mut game = match fen {
+            Some(f) => Game::from_fen(&f).map_err(|e| format!("Bad FEN in PGN: {e}"))?,
+            None => Game::new(),
+        };
+        for raw in clean.split_whitespace() {
+            if raw.starts_with('$') || matches!(raw, "1-0" | "0-1" | "1/2-1/2" | "*") {
+                continue;
+            }
+            // drop a leading move number like `12.` / `12...` (may be glued to the move: `12.Nf3`)
+            let tok = if raw.starts_with("0-0") { raw } else { raw.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches('.') };
+            if tok.is_empty() || tok.chars().all(|c| c == '.') {
+                continue;
+            }
+            let pos = game.pos.clone();
+            let mv = san::from_san(&pos, tok).ok_or_else(|| format!("Couldn't understand the move \"{}\" in the PGN.", tok))?;
+            game.play(mv)?;
+        }
+        Ok(game)
+    }
+}
+
 fn ymd_today() -> (i64, u32, u32) {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let z = secs.div_euclid(86400) + 719_468;

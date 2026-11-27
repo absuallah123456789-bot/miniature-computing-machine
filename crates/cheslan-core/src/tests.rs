@@ -253,3 +253,13 @@ fn sacrifice_detection() {
     // Hanging a knight to a pawn.
     assert!(sacrifice_cp("4k3/8/8/3p4/8/2N5/8/4K3 w - - 0 1", "c3e4") <= -200);
 }
+
+#[test]
+fn pgn_import() {
+    let pgn = "[Event \"x\"]\n[White \"a\"]\n\n1. e4 {best by test} e5 2. Nf3 (2. f4) Nc6 $1 3. Bb5 a6 *";
+    let g = Game::from_pgn(pgn).unwrap();
+    assert_eq!(g.moves.len(), 6);
+    assert!(eco::lookup(g.keys()).unwrap().1.starts_with("Ruy Lopez"));
+    assert!(Game::from_pgn("1. e4 e4").is_err());
+    assert_eq!(Game::from_pgn("1.e4 e5 2.Nf3 Nc6 3.Bc4 Nf6 4.0-0 Bc5").unwrap().moves.len(), 8);
+}

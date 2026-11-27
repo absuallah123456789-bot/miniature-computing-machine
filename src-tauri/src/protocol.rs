@@ -3,7 +3,7 @@
 use cheslan_core::types::Color;
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 pub const DISCOVERY_PORT: u16 = 47474;
 pub const GAME_PORT: u16 = 47475;
 pub const MAX_FRAME: usize = 256 * 1024;
@@ -48,6 +48,9 @@ pub struct Beacon {
     pub os: String,
     pub port: u16,
     pub avatar_hash: String,
+    /// True while this player is in a game (so others can offer to spectate).
+    #[serde(default)]
+    pub in_game: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,7 +68,8 @@ pub enum Msg {
     ProfileReq,
     Profile { profile: WireProfile },
     /// `color` = the challenger's preference: "white" | "black" | "random".
-    Challenge { profile: WireProfile, v: u32, tc: TimeControl, color: String },
+    /// `pgn` = optional PGN to start the game from (e.g. to continue after a connection loss).
+    Challenge { profile: WireProfile, v: u32, tc: TimeControl, color: String, #[serde(default)] pgn: Option<String> },
     /// `your_color` is the colour assigned to the challenger; `sid` identifies the session for resuming.
     Accept { your_color: Color, profile: WireProfile, tc: TimeControl, sid: String },
     Decline,
@@ -93,4 +97,29 @@ pub enum Msg {
     RematchDecline,
     Ping,
     Leave,
+    /// Spectator -> player: "let me watch your game".
+    Spectate { profile: WireProfile, v: u32 },
+    /// Player -> spectator: both players' profiles (`host` = the player the spectator connected to).
+    SpecWelcome { host: WireProfile, other: WireProfile, tc: TimeControl, #[serde(default)] start_fen: Option<String> },
+    /// Player -> spectator: full mirror of the game (sent after every change).
+    SpecSync { data: SpecSyncData },
+    /// Player -> other player: a spectator joined (for the toast).
+    SpecJoined { name: String },
+    /// Group chat line. Spectator -> host: `from` is ignored (host fills in the real name).
+    GroupChat { from: String, text: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpecSyncData {
+    pub moves: Vec<String>,
+    /// Colour the host (the player the spectator is connected to) currently plays.
+    pub host_color: Color,
+    pub white_ms: i64,
+    pub black_ms: i64,
+    /// Whose clock is running, if any.
+    pub running: Option<Color>,
+    /// "resigned" | "draw_agreed" | "timeout" when the game was ended off-board.
+    pub forced_kind: Option<String>,
+    pub forced_winner: Option<Color>,
+    pub game_no: u32,
 }

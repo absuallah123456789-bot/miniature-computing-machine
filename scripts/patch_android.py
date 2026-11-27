@@ -17,6 +17,7 @@ ok = True
 # ---- manifest ----
 PERMS = [
     "android.permission.INTERNET",                     # TCP game channel + UDP discovery sockets
+    "android.permission.VIBRATE",                      # haptics: low clock / check / game over
     "android.permission.ACCESS_NETWORK_STATE",
     "android.permission.ACCESS_WIFI_STATE",
     "android.permission.CHANGE_WIFI_MULTICAST_STATE",  # harmless; lets future mDNS code hold a MulticastLock

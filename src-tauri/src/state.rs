@@ -92,6 +92,8 @@ pub struct PlayerDto {
     pub name: String,
     pub os: String,
     pub avatar: Option<String>,
+    /// Peer is currently playing a game (spectatable). Always false for session players.
+    pub in_game: bool,
 }
 
 pub struct Peer {
@@ -110,6 +112,8 @@ pub enum Phase {
     Outgoing(PlayerDto),
     Incoming(PlayerDto),
     Playing,
+    /// Watching someone else's game.
+    Spectating,
 }
 
 impl Phase {
@@ -119,6 +123,7 @@ impl Phase {
             Phase::Outgoing(_) => "outgoing",
             Phase::Incoming(_) => "incoming",
             Phase::Playing => "playing",
+            Phase::Spectating => "spectating",
         }
     }
 }
@@ -126,6 +131,19 @@ impl Phase {
 pub struct Link {
     pub id: u64,
     pub tx: UnboundedSender<Msg>,
+}
+
+/// A spectator attached to *our* game.
+pub struct SpecLink {
+    pub id: u64,
+    pub name: String,
+    pub tx: UnboundedSender<Msg>,
+}
+
+/// Who the two players are, from a spectator's point of view.
+pub struct SpecInfo {
+    pub host: PlayerDto,
+    pub other: PlayerDto,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,6 +196,9 @@ pub struct Session {
     pub rematch_in: bool,
     pub rematch_out: bool,
     pub game_no: u32,
+    /// True for a read-only mirror of someone else's game.
+    pub spectator: bool,
+    pub spec: Option<SpecInfo>,
 }
 
 pub struct Inner {
@@ -188,7 +209,10 @@ pub struct Inner {
     pub session: Option<Session>,
     pub data_dir: PathBuf,
     pub pending: Option<(TimeControl, String)>,
+    /// PGN the pending challenge starts from (validated).
+    pub pending_pgn: Option<String>,
     pub peer_addr: Option<SocketAddr>,
+    pub spectators: Vec<SpecLink>,
 }
 
 pub struct Shared {
@@ -216,7 +240,7 @@ impl Shared {
             my_id,
             game_port: AtomicU16::new(GAME_PORT),
             conn_seq: AtomicU64::new(0),
-            inner: Mutex::new(Inner { profile, peers: HashMap::new(), link: None, phase: Phase::Idle, session: None, data_dir, pending: None, peer_addr: None }),
+            inner: Mutex::new(Inner { profile, peers: HashMap::new(), link: None, phase: Phase::Idle, session: None, data_dir, pending: None, pending_pgn: None, peer_addr: None, spectators: Vec::new() }),
         }
     }
 
@@ -225,6 +249,9 @@ impl Shared {
     }
     pub fn emit_state(&self) {
         self.emit("state-changed", ());
+        // Mirror the new state to our spectators. NOTE: callers must not hold `inner` locked.
+        let g = self.inner.lock().unwrap();
+        push_spec_sync(&g);
     }
 
     pub fn me_dto(&self, inner: &Inner) -> PlayerDto {
@@ -234,6 +261,7 @@ impl Shared {
             name: p.map(|p| p.name.clone()).unwrap_or_default(),
             os: my_os(),
             avatar: p.and_then(|p| p.avatar_data_url.clone()),
+            in_game: false,
         }
     }
 
@@ -251,6 +279,35 @@ impl Shared {
 pub fn send(inner: &Inner, msg: Msg) {
     if let Some(l) = &inner.link {
         let _ = l.tx.send(msg);
+    }
+}
+
+/// Send `msg` to every spectator attached to our game, except the one with id `skip`.
+pub fn fan_out(inner: &Inner, msg: &Msg, skip: Option<u64>) {
+    for sp in &inner.spectators {
+        if Some(sp.id) != skip {
+            let _ = sp.tx.send(msg.clone());
+        }
+    }
+}
+
+/// Push the current game mirror to all spectators.
+pub fn push_spec_sync(inner: &Inner) {
+    if inner.spectators.is_empty() {
+        return;
+    }
+    if let Some(s) = inner.session.as_ref() {
+        fan_out(inner, &Msg::SpecSync { data: s.spec_sync() }, None);
+    }
+}
+
+/// Re-encode a (thumbnail) PlayerDto for the wire.
+pub fn dto_to_wire(p: &PlayerDto) -> WireProfile {
+    WireProfile {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        os: p.os.clone(),
+        avatar: p.avatar.as_ref().and_then(|a| a.strip_prefix("data:image/jpeg;base64,")).map(|a| a.to_string()),
     }
 }
 
@@ -324,6 +381,7 @@ pub struct SessionDto {
     pub rematch_out: bool,
     pub game_no: u32,
     pub ply: usize,
+    pub spectator: bool,
 }
 
 impl Session {
@@ -346,7 +404,85 @@ impl Session {
             rematch_in: false,
             rematch_out: false,
             game_no,
+            spectator: false,
+            spec: None,
         }
+    }
+
+    /// Read-only mirror of the game `host` is playing against `other`.
+    pub fn new_spectator(host: PlayerDto, other: PlayerDto, tc: TimeControl, start_fen: Option<String>) -> Session {
+        let mut s = Session::new(host.clone(), other.clone(), Color::White, 1, tc, String::new(), false);
+        s.spectator = true;
+        s.spec = Some(SpecInfo { host, other });
+        if let Some(f) = start_fen {
+            if let Ok(g) = Game::from_fen(&f) {
+                s.game = g;
+            }
+        }
+        s
+    }
+
+    /// Replace the game with one replayed from a PGN (start of a PGN-based game).
+    pub fn with_game(&mut self, game: Game) {
+        self.game = game;
+        let ply = self.game.moves.len();
+        let ended = self.end().is_some();
+        if let Some(cl) = self.clock.as_mut() {
+            cl.last = if ply >= 2 && !ended { Some(Instant::now()) } else { None };
+        }
+    }
+
+    /// What a spectator needs to mirror this game.
+    pub fn spec_sync(&self) -> SpecSyncData {
+        let (forced_kind, forced_winner) = match self.forced {
+            Some(e) => {
+                let k = match e.kind {
+                    EndKind::Resigned => "resigned",
+                    EndKind::DrawAgreed => "draw_agreed",
+                    EndKind::Timeout => "timeout",
+                    _ => "",
+                };
+                (Some(k.to_string()), e.winner)
+            }
+            None => (None, None),
+        };
+        SpecSyncData {
+            moves: self.uci_moves(),
+            host_color: self.my_color,
+            white_ms: self.remaining(Color::White).max(0),
+            black_ms: self.remaining(Color::Black).max(0),
+            running: self.running(),
+            forced_kind,
+            forced_winner,
+            game_no: self.game_no,
+        }
+    }
+
+    /// Apply a host snapshot to a spectator mirror.
+    pub fn apply_spec_sync(&mut self, d: &SpecSyncData) -> Result<(), String> {
+        let mut g = Game::from_position(self.game.start.clone());
+        for u in &d.moves {
+            g.play_uci(u)?;
+        }
+        self.game = g;
+        if let Some(si) = &self.spec {
+            let (w, b) = if d.host_color == Color::White { (si.host.clone(), si.other.clone()) } else { (si.other.clone(), si.host.clone()) };
+            self.me = w;
+            self.opp = b;
+        }
+        self.my_color = Color::White; // spectators always view from White's side
+        self.game_no = d.game_no;
+        self.forced = match d.forced_kind.as_deref() {
+            Some("resigned") => Some(GameEnd { kind: EndKind::Resigned, winner: d.forced_winner }),
+            Some("draw_agreed") => Some(GameEnd { kind: EndKind::DrawAgreed, winner: None }),
+            Some("timeout") => Some(GameEnd { kind: EndKind::Timeout, winner: d.forced_winner }),
+            _ => None,
+        };
+        if self.tc.enabled() {
+            let running = d.running.is_some() && self.end().is_none();
+            self.clock = Some(Clock { white_ms: d.white_ms, black_ms: d.black_ms, last: if running { Some(Instant::now()) } else { None } });
+        }
+        Ok(())
     }
 
     fn mk_clock(tc: TimeControl) -> Option<Clock> {
@@ -473,7 +609,7 @@ impl Session {
         let pieces = (0..64u8)
             .filter_map(|sq| pos.board[sq as usize].map(|p| PieceDto { sq, color: p.color.name(), kind: p.kind.name() }))
             .collect();
-        let legal = if end.is_none() && self.connected && pos.side == self.my_color {
+        let legal = if !self.spectator && end.is_none() && self.connected && pos.side == self.my_color {
             pos.legal_moves().into_iter().map(|m| MoveDto { from: m.from, to: m.to, promo: m.promo.map(|k| k.name()) }).collect()
         } else {
             vec![]
@@ -546,6 +682,7 @@ impl Session {
             rematch_out: self.rematch_out,
             game_no: self.game_no,
             ply: self.game.moves.len(),
+            spectator: self.spectator,
         }
     }
 }

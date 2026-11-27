@@ -1,6 +1,6 @@
 use crate::{net, protocol::*, state::*};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use cheslan_core::{eco, game::Outcome, review, types::*};
+use cheslan_core::{eco, game::{Game, Outcome}, review, types::*};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,16 +26,29 @@ pub struct GameSettings {
     pub bonus_ms: u64,
     /// "white" | "black" | "random" (the challenger's colour)
     pub color: String,
+    /// Optional PGN to start the game from.
+    #[serde(default)]
+    pub pgn: Option<String>,
 }
 
 impl GameSettings {
-    fn parse(self) -> Result<(TimeControl, String), String> {
+    fn parse(self) -> Result<(TimeControl, String, Option<String>), String> {
         let tc = TimeControl { initial_ms: self.initial_ms, bonus_ms: self.bonus_ms };
         tc.validate()?;
         if !valid_color_pref(&self.color) {
             return Err("Bad colour choice.".into());
         }
-        Ok((tc, self.color))
+        let pgn = match self.pgn.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => {
+                let g = Game::from_pgn(t)?;
+                if g.outcome() != Outcome::Ongoing {
+                    return Err("That PGN is already a finished game.".into());
+                }
+                Some(t.to_string())
+            }
+            _ => None,
+        };
+        Ok((tc, self.color, pgn))
     }
 }
 
@@ -115,13 +128,18 @@ pub fn list_peers(sh: Sh<'_>) -> Vec<PlayerDto> {
 
 #[tauri::command]
 pub async fn challenge(sh: Sh<'_>, peer_id: String, settings: GameSettings) -> Result<(), String> {
-    let (tc, color) = settings.parse()?;
-    net::challenge_peer(sh.inner().clone(), peer_id, tc, color).await
+    let (tc, color, pgn) = settings.parse()?;
+    net::challenge_peer(sh.inner().clone(), peer_id, tc, color, pgn).await
+}
+
+#[tauri::command]
+pub async fn spectate(sh: Sh<'_>, peer_id: String) -> Result<(), String> {
+    net::spectate_peer(sh.inner().clone(), peer_id).await
 }
 
 #[tauri::command]
 pub async fn challenge_ip(sh: Sh<'_>, addr: String, settings: GameSettings) -> Result<(), String> {
-    let (tc, color) = settings.parse()?;
+    let (tc, color, pgn) = settings.parse()?;
     let addr = addr.trim();
     let sa = if let Ok(sa) = addr.parse::<SocketAddr>() {
         sa
@@ -130,7 +148,7 @@ pub async fn challenge_ip(sh: Sh<'_>, addr: String, settings: GameSettings) -> R
     } else {
         return Err("Enter an IPv4 address such as 192.168.1.20 (optionally :port).".into());
     };
-    net::challenge_addr(sh.inner().clone(), sa, tc, color).await
+    net::challenge_addr(sh.inner().clone(), sa, tc, color, pgn).await
 }
 
 #[tauri::command]
@@ -149,12 +167,19 @@ pub fn respond_challenge(sh: Sh<'_>, accept: bool) -> Result<(), String> {
             let me = sh.me_dto(inner);
             let wire = sh.wire_profile(inner);
             let sid = random_alnum(16);
-            inner.session = Some(Session::new(me, opp, challenger.opp(), 1, tc, sid.clone(), false));
+            let mut sess = Session::new(me, opp, challenger.opp(), 1, tc, sid.clone(), false);
+            if let Some(pgn) = inner.pending_pgn.take() {
+                if let Ok(game) = Game::from_pgn(&pgn) {
+                    sess.with_game(game);
+                }
+            }
+            inner.session = Some(sess);
             inner.phase = Phase::Playing;
             send(inner, Msg::Accept { your_color: challenger, profile: wire, tc, sid });
         } else {
             send(inner, Msg::Decline);
             inner.link = None;
+            inner.pending_pgn = None;
             inner.phase = Phase::Idle;
         }
     }
@@ -197,6 +222,9 @@ pub fn make_move(sh: Sh<'_>, uci: String) -> Result<SessionDto, String> {
     let mut g = sh.inner.lock().unwrap();
     let inner = &mut *g;
     let s = inner.session.as_mut().ok_or("No game in progress.".to_string())?;
+    if s.spectator {
+        return Err("Spectators can't move.".into());
+    }
     if !s.connected {
         return Err("Opponent is disconnected.".into());
     }
@@ -216,6 +244,7 @@ pub fn make_move(sh: Sh<'_>, uci: String) -> Result<SessionDto, String> {
     let clock_ms = s.my_clock_report();
     let dto = s.dto();
     send(inner, Msg::Move { uci, ply: ply_before as u32, clock_ms });
+    push_spec_sync(inner);
     Ok(dto)
 }
 
@@ -223,6 +252,9 @@ fn with_live_session<F: FnOnce(&mut Session, &Inner) -> Option<Msg>>(sh: &Arc<Sh
     {
         let mut g = sh.inner.lock().unwrap();
         let inner = &mut *g;
+        if inner.session.as_ref().map(|s| s.spectator).unwrap_or(false) {
+            return Err("Spectators can't do that.".into());
+        }
         let mut s = inner.session.take().ok_or("No game in progress.".to_string())?;
         let msg = f(&mut s, inner);
         inner.session = Some(s);
@@ -282,7 +314,14 @@ pub fn send_chat(sh: Sh<'_>, text: String) -> Result<String, String> {
     if g.session.as_ref().map(|s| s.connected) != Some(true) {
         return Err("Opponent is disconnected.".into());
     }
-    send(&g, Msg::Chat { text: t.clone() });
+    if g.session.as_ref().map(|s| s.spectator).unwrap_or(false) {
+        // spectators talk to the host, who relays to everyone
+        send(&g, Msg::GroupChat { from: String::new(), text: t.clone() });
+    } else {
+        send(&g, Msg::Chat { text: t.clone() });
+        let from = g.session.as_ref().map(|s| s.me.name.clone()).unwrap_or_default();
+        fan_out(&g, &Msg::GroupChat { from, text: t.clone() }, None);
+    }
     Ok(t)
 }
 
@@ -323,9 +362,14 @@ pub fn leave_game(sh: Sh<'_>) {
         let mut g = sh.inner.lock().unwrap();
         let inner = &mut *g;
         send(inner, Msg::Leave);
+        for sp in &inner.spectators {
+            let _ = sp.tx.send(Msg::Leave);
+        }
+        inner.spectators.clear();
         inner.link = None;
         inner.session = None;
         inner.pending = None;
+        inner.pending_pgn = None;
         inner.peer_addr = None;
         inner.phase = Phase::Idle;
     }

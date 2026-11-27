@@ -241,7 +241,7 @@ input[type=text] { background: var(--surface); border: 1px solid var(--line); bo
 .settings[open] > summary { border-color: var(--accent); }
 .settings[open] > summary::after { content: "▴"; }
 #settings-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.settings-panel { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 20; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+.settings-panel { max-height: 70dvh; overflow: auto; position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 20; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
 select { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: inherit; width: 100%; }
 .custom-box { display: flex; flex-direction: column; gap: 10px; }
 .custom-box input[type=range] { width: 100%; accent-color: var(--accent); }
@@ -278,3 +278,18 @@ select { background: var(--surface-2); color: var(--ink); border: 1px solid var(
 /* premove ghost: translucent copy of the piece */
 .piece.ghost { position: absolute; inset: 4%; width: 92%; height: 92%; opacity: .5; z-index: 3; }
 .piece.ghost.lifted { opacity: .2; }
+
+/* ---- PGN start box ---- */
+textarea { background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; width: 100%; font: inherit; font-size: .85rem; resize: vertical; min-height: 5.5em; }
+.pgn-box > summary { cursor: pointer; color: var(--muted); font-size: .9rem; padding: 2px 0 6px; }
+.pgn-box[open] > summary { color: var(--ink); }
+.pgn-box textarea { margin-bottom: 6px; }
+
+/* ---- arrows & square highlights (PC) ---- */
+.board-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 7; pointer-events: none; overflow: visible; }
+.hl { position: absolute; inset: 0; z-index: 0; opacity: .6; pointer-events: none; }
+.hl-green { background: #15a02b; } .hl-red { background: #d9382b; } .hl-blue { background: #2f7de1; } .hl-yellow { background: #e0b21a; }
+
+/* ---- spectators / group chat ---- */
+.peer .os.ingame { color: var(--accent); border-color: var(--accent); }
+.bubble-from { display: block; font-size: .7rem; font-weight: 700; opacity: .75; margin-bottom: 2px; }

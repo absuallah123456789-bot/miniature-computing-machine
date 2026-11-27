@@ -7,6 +7,7 @@ export const api = {
   saveProfile: (name, avatarPng, avatarThumb) => invoke('save_profile', { name, avatarPng, avatarThumb }),
   listPeers: () => invoke('list_peers'),
   challenge: (peerId, settings) => invoke('challenge', { peerId, settings }),
+  spectate: (peerId) => invoke('spectate', { peerId }),
   challengeIp: (addr, settings) => invoke('challenge_ip', { addr, settings }),
   respondChallenge: (accept) => invoke('respond_challenge', { accept }),
   cancelChallenge: () => invoke('cancel_challenge'),

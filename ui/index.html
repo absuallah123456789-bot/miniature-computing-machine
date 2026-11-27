@@ -86,6 +86,11 @@
                 <button type="button" class="color-opt rand" data-color="random" role="radio">Random</button>
               </div>
             </div>
+            <details id="pgn-box" class="pgn-box">
+              <summary>Start based on PGN</summary>
+              <textarea id="in-pgn" rows="5" spellcheck="false" autocomplete="off" placeholder="Paste a PGN here to continue a game (e.g. after a connection loss). Leave empty for a normal game."></textarea>
+              <small class="muted">The game starts from the position reached by this PGN, with the colours and clock chosen above.</small>
+            </details>
           </div>
         </details>
         <button id="btn-confirm" class="btn primary compact">Confirm</button>

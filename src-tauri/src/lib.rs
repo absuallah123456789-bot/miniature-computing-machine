@@ -41,6 +41,7 @@ pub fn run() {
             commands::list_peers,
             commands::challenge,
             commands::challenge_ip,
+            commands::spectate,
             commands::respond_challenge,
             commands::cancel_challenge,
             commands::get_phase,
