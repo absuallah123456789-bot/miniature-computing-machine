@@ -107,7 +107,7 @@ input[type=text] { background: var(--surface); border: 1px solid var(--line); bo
 .theme-option[aria-checked=true], .preference-options [aria-checked=true] { border-color: var(--accent); }
 .theme-preview { width: 100%; aspect-ratio: 2 / 1; display: grid; grid-template-columns: 1fr 1fr; overflow: hidden; border-radius: 4px; }
 .theme-preview i { display: block; }
-.preference-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.preference-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); gap: 8px; }
 .preference-options [aria-checked=true] { background: var(--surface-2); }
 .modal h2 { margin: 0; font-family: var(--serif); font-size: 1.6rem; }
 .modal .sub { margin: -6px 0 0; color: var(--muted); }
@@ -194,11 +194,18 @@ input[type=text] { background: var(--surface); border: 1px solid var(--line); bo
   #app.game-layout {
     max-width: none;
     height: 100dvh; min-height: 0; overflow: hidden;
-    align-content: center;
-    grid-template-columns: minmax(0, var(--stage)) minmax(150px, 190px);
+    align-content: stretch;
+    width: 100%;
+    grid-template-columns: minmax(0, var(--stage)) minmax(0, 1fr);
+    grid-template-rows: auto auto auto 1fr auto;
     gap: 6px 12px;
     padding: 8px 10px;
   }
+}
+@media (orientation: landscape) and (max-width: 699px), (orientation: landscape) and (max-height: 520px) {
+  #app.game-layout #bar-me { align-self: end; }
+  #app.game-layout .controls { align-self: center; }
+  #app.game-layout .brand { align-self: start; }
 }
 @media (max-width: 440px) {
   .theme-options { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -267,3 +274,7 @@ select { background: var(--surface-2); color: var(--ink); border: 1px solid var(
 }
 .piece.check-anim { animation: checked-king 1.1s ease-in-out both; }
 @media (prefers-reduced-motion: reduce) { .sq.check::before { animation: none; } .piece { transition: none !important; animation: none !important; } }
+
+/* premove ghost: translucent copy of the piece */
+.piece.ghost { position: absolute; inset: 4%; width: 92%; height: 92%; opacity: .5; z-index: 3; }
+.piece.ghost.lifted { opacity: .2; }

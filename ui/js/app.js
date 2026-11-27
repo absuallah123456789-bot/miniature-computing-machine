@@ -37,7 +37,7 @@ const st = {
   viewPly: 0,
   checkAnimSq: null,
   connectionWasLost: false,
-  settings: { type: '3+2', initial: 10, bonus: 0, color: 'random', boardTheme: 'classic', moveStyle: 'both', classifications: 'you' },
+  settings: { type: '3+2', initial: 10, bonus: 0, color: 'random', boardTheme: 'classic', moveStyle: 'both', classifications: 'none', autoQueen: false },
 };
 
 // ---------------- game settings (time control + colour) ----------------
@@ -77,7 +77,8 @@ function loadSettings() {
     Object.assign(st.settings, JSON.parse(localStorage.getItem('cheslan.settings') || '{}'));
     if (!BOARD_THEMES[st.settings.boardTheme]) st.settings.boardTheme = 'classic';
     if (!['drag', 'click', 'both'].includes(st.settings.moveStyle)) st.settings.moveStyle = 'both';
-    if (!['none', 'you', 'opponent', 'both'].includes(st.settings.classifications)) st.settings.classifications = 'you';
+    if (!['none', 'you', 'opponent', 'both'].includes(st.settings.classifications)) st.settings.classifications = 'none';
+    if (typeof st.settings.autoQueen !== 'boolean') st.settings.autoQueen = false;
   } catch { /* ignore */ }
 }
 function saveSettings() { try { localStorage.setItem('cheslan.settings', JSON.stringify(st.settings)); } catch { /* ignore */ } }
@@ -88,10 +89,13 @@ function applyPreferences() {
   document.documentElement.style.setProperty('--sq-dark', theme.dark);
   $('app').dataset.moveStyle = st.settings.moveStyle;
   saveSettings();
+  if (st.settings.classifications !== 'none') void ensureLiveClassifier().catch((e) => console.error('Stockfish initialization failed:', e));
   if (st.session) { renderGame(); void classifyPendingMoves(); }
 }
 
 function ensureLiveClassifier() {
+  // Stockfish is only loaded when classifications are enabled (default: off)
+  if (!st.liveClassifier && st.settings.classifications === 'none') return Promise.resolve();
   if (!st.liveClassifier) {
     st.liveClassifier = createLiveClassifier();
     st.classifierReady = st.liveClassifier.ready.then(() => {
@@ -170,6 +174,9 @@ function openAppSettings() {
     ),
     h('div', { class: 'field' }, h('span', { text: 'Moving type' }),
       preferenceOptions('moveStyle', [['drag', 'Drag'], ['click', 'Click'], ['both', 'Both']], build)),
+    h('div', { class: 'field' }, h('span', { text: 'Auto promote to queen' }),
+      preferenceOptions('autoQueen', [[false, 'Off'], [true, 'On']], build),
+      h('small', { class: 'muted', text: 'Skips the promotion popup and always promotes to a queen.' })),
     h('div', { class: 'field' }, h('span', { text: 'Move classifications' }),
       preferenceOptions('classifications', [['none', 'None'], ['you', 'You'], ['opponent', 'Opponent'], ['both', 'Both']], build),
       h('small', { class: 'muted', text: st.settings.classifications === 'none' ? 'Move analysis is off.' : st.classifierLoaded ? 'Stockfish is ready for move analysis.' : 'Stockfish loads in the background before a game starts.' })),
@@ -527,10 +534,11 @@ function renderBoard(s) {
   const premoveView = st.premoveQueue.length && s.connected && !s.end && s.check_sq == null && st.viewPly === s.ply
     ? premovePosition(s)
     : s.pieces;
-  const pm = new Map(premoveView.map((p) => [p.sq, p]));
+  const pm = new Map(s.pieces.map((p) => [p.sq, p])); // real pieces never move for premoves
+  const ghosts = new Map(premoveView.filter((p) => p.origin !== p.sq).map((p) => [p.sq, p]));
   const targets = new Set();
-  if (st.sel != null) {
-    const moves = canQueuePremove(s) ? premoveTargets(s, st.sel) : s.legal.filter((m) => m.from === st.sel);
+  if (st.sel != null && !canQueuePremove(s)) { // premove ghosts may go anywhere, so no target dots
+    const moves = s.legal.filter((m) => m.from === st.sel);
     for (const m of moves) targets.add(m.to);
   }
   const mated = s.end && s.end.kind === 'checkmate';
@@ -551,7 +559,7 @@ function renderBoard(s) {
       const p = pm.get(sq);
       if (p) {
         const pieceClass = ['piece'];
-        if (st.drag && st.drag.from === sq) pieceClass.push('lifted');
+        if (st.drag && st.drag.from === sq && !ghosts.has(sq)) pieceClass.push('lifted');
         if (sq === st.checkAnimSq && p.kind === 'king') pieceClass.push('check-anim');
         const moveClass = st.viewPly > 0 ? st.moveClasses[st.viewPly - 1] : null;
         const selectedSide = st.settings.classifications !== 'none' && (st.settings.classifications === 'both'
@@ -564,6 +572,8 @@ function renderBoard(s) {
         d.append(piece);
         if (annotated) d.append(h('img', { class: 'move-class-badge', src: `assets/moves/${moveClass}.svg`, alt: meta.label, title: meta.label, draggable: 'false' }));
       }
+      const g = ghosts.get(sq);
+      if (g) d.append(h('img', { class: 'piece ghost' + (st.drag && st.drag.from === sq ? ' lifted' : ''), src: pieceSrc(g.color, g.kind), alt: `ghost ${g.color} ${g.kind}`, draggable: 'false' }));
       el.append(d);
     }
   }
@@ -673,7 +683,8 @@ function premovePosition(s) {
       const rook = pieces.get(rookFrom);
       if (rook) {
         pieces.delete(rookFrom);
-        pieces.set(rank | (kingSide ? 5 : 3), rook);
+        rook.sq = rank | (kingSide ? 5 : 3);
+        pieces.set(rook.sq, rook);
       }
     }
     if (move.promo) piece.kind = move.promo;
@@ -683,78 +694,16 @@ function premovePosition(s) {
   return [...pieces.values()];
 }
 
-function premoveRoutes(s) {
-  return premovePosition(s)
-    .filter((p) => p.origin !== p.sq)
-    .map((p) => ({ from: p.origin, to: p.sq }));
+function premoveRoutes() {
+  return []; // ghosts: real pieces never move, so nothing needs to slide back
 }
 
+/** Ghost premoves may go to ANY square; legality is checked when the move is actually played (illegal => all premoves cancel). */
 function premoveTargets(s, from) {
-  const pieces = premovePosition(s);
-  const piece = pieces.find((p) => p.sq === from);
+  const piece = premovePosition(s).find((p) => p.sq === from);
   if (!piece || piece.color !== s.my_color) return [];
-  const file = from & 7, rank = from >> 3;
-  const occupied = (sq) => pieces.find((p) => p.sq === sq);
-  const add = (to) => {
-    if (to < 0 || to >= 64) return;
-    const target = occupied(to);
-    if (!target || target.color !== piece.color) moves.push({ from, to });
-  };
   const moves = [];
-  if (piece.kind === 'pawn') {
-    const dir = piece.color === 'white' ? 1 : -1;
-    const nextRank = rank + dir;
-    if (nextRank >= 0 && nextRank < 8) {
-      const forward = nextRank * 8 + file;
-      if (!occupied(forward)) {
-        add(forward);
-        const startRank = piece.color === 'white' ? 1 : 6;
-        const double = (rank + 2 * dir) * 8 + file;
-        if (rank === startRank && !occupied(double)) add(double);
-      }
-      for (const df of [-1, 1]) {
-        const targetFile = file + df;
-        if (targetFile >= 0 && targetFile < 8) {
-          const to = nextRank * 8 + targetFile;
-          if (occupied(to) && occupied(to).color !== piece.color) moves.push({ from, to });
-        }
-      }
-    }
-    return moves;
-  }
-  if (piece.kind === 'knight') {
-    for (const [df, dr] of [[1, 2], [2, 1], [2, -1], [1, -2], [-1, -2], [-2, -1], [-2, 1], [-1, 2]]) {
-      const f = file + df, r = rank + dr;
-      if (f >= 0 && f < 8 && r >= 0 && r < 8) add(r * 8 + f);
-    }
-    return moves;
-  }
-  const dirs = [];
-  if (piece.kind === 'bishop' || piece.kind === 'queen') dirs.push([1, 1], [1, -1], [-1, 1], [-1, -1]);
-  if (piece.kind === 'rook' || piece.kind === 'queen') dirs.push([1, 0], [-1, 0], [0, 1], [0, -1]);
-  if (piece.kind === 'king') dirs.push([1, 1], [1, -1], [-1, 1], [-1, -1], [1, 0], [-1, 0], [0, 1], [0, -1]);
-  for (const [df, dr] of dirs) {
-    for (let f = file + df, r = rank + dr; f >= 0 && f < 8 && r >= 0 && r < 8; f += df, r += dr) {
-      const to = r * 8 + f;
-      add(to);
-      if (occupied(to) || piece.kind === 'king') break;
-    }
-  }
-  if (piece.kind === 'king' && file === 4) {
-    const homeRank = piece.color === 'white' ? 0 : 7;
-    const rights = (s.position_history[s.ply] || '').split(' ')[2] || '';
-    const kingRight = piece.color === 'white' ? 'K' : 'k';
-    const queenRight = piece.color === 'white' ? 'Q' : 'q';
-    const rookRightSq = homeRank * 8 + 7, rookLeftSq = homeRank * 8;
-    if (rank === homeRank && rights.includes(kingRight) && !occupied(homeRank * 8 + 5) && !occupied(homeRank * 8 + 6)
-      && pieces.some((p) => p.sq === rookRightSq && p.color === piece.color && p.kind === 'rook')) {
-      moves.push({ from, to: homeRank * 8 + 6 });
-    }
-    if (rank === homeRank && rights.includes(queenRight) && !occupied(homeRank * 8 + 1) && !occupied(homeRank * 8 + 2) && !occupied(homeRank * 8 + 3)
-      && pieces.some((p) => p.sq === rookLeftSq && p.color === piece.color && p.kind === 'rook')) {
-      moves.push({ from, to: homeRank * 8 + 2 });
-    }
-  }
+  for (let to = 0; to < 64; to++) if (to !== from) moves.push({ from, to });
   return moves;
 }
 
@@ -776,9 +725,7 @@ function queuePremove(from, to) {
   const move = { from, to, promo: promoRank ? 'queen' : null };
   st.premoveQueue.push(move);
   st.sel = null;
-  st.anim = { prev: { ...s, pieces: before }, move: [from, to], virtual: true };
   renderGame();
-  st.anim = null;
 }
 
 async function playQueuedPremove(s) {
@@ -824,13 +771,14 @@ function onBoardDown(e) {
   const dragMoves = st.settings.moveStyle !== 'click';
   if (canQueuePremove(s)) {
     const projected = premovePosition(s);
-    if (clickMoves && st.sel != null && premoveTargets(s, st.sel).some((m) => m.to === sq)) {
+    const ownHere = projected.find((p) => p.sq === sq && p.color === s.my_color);
+    if (clickMoves && st.sel != null && sq !== st.sel && !ownHere) {
       e.preventDefault();
       queuePremove(st.sel, sq);
       return;
     }
     const piece = projected.find((p) => p.sq === sq);
-    if (piece && piece.color === s.my_color && premoveTargets(s, sq).length) {
+    if (piece && piece.color === s.my_color) {
       if (clickMoves) {
         st.sel = sq;
         if (!dragMoves) { renderBoard(s); return; }
@@ -895,7 +843,7 @@ async function playMove(from, to, targets, hint, premove = false) {
   const s = st.session;
   let promo = '';
   if (targets.some((m) => m.promo)) {
-    if (premove) promo = 'q';
+    if (premove || st.settings.autoQueen) promo = 'q';
     else {
       const choice = await askPromotion(s.my_color);
       if (!choice) { st.sel = null; renderBoard(s); return; }
